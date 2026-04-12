@@ -4,16 +4,33 @@
  *   POST /api/scores  { "school": "○○대", "game": "grade-hunt", "score": 120 }
  *   GET  /api/rankings?school=○○대   (선택: 내 학교 순위 요약)
  *   GET  /api/rankings               (학교별 누적 점수 TOP)
+ *
+ * 저장소: DATABASE_URL 이 있으면 PostgreSQL, 없으면 data/scores.json
  */
 
 const fs = require("fs");
 const path = require("path");
 const express = require("express");
 const cors = require("cors");
+const { Pool } = require("pg");
 
 const PORT = Number(process.env.PORT) || 3000;
+const DATABASE_URL = process.env.DATABASE_URL || "";
 const DATA_DIR = path.join(__dirname, "data");
 const DATA_FILE = path.join(DATA_DIR, "scores.json");
+
+/** Render Postgres 등 외부 호스트는 TLS 필요 */
+function createPool() {
+  if (!DATABASE_URL) return null;
+  const useSsl =
+    DATABASE_URL.includes("sslmode=require") || /\.render\.com\//.test(DATABASE_URL);
+  return new Pool({
+    connectionString: DATABASE_URL,
+    ...(useSsl ? { ssl: { rejectUnauthorized: false } } : {})
+  });
+}
+
+const pool = createPool();
 
 const ANIMAL_TIERS = [
   { min: 5000, emoji: "🐯", name: "호랑이" },
@@ -53,6 +70,21 @@ function writeStore(data) {
   fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), "utf8");
 }
 
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS score_records (
+      id VARCHAR(64) PRIMARY KEY,
+      school VARCHAR(60) NOT NULL,
+      game VARCHAR(40) NOT NULL,
+      score INTEGER NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      CONSTRAINT score_records_score_range CHECK (score >= -100000 AND score <= 1000000)
+    );
+    CREATE INDEX IF NOT EXISTS idx_score_records_school ON score_records (school);
+    CREATE INDEX IF NOT EXISTS idx_score_records_created_at ON score_records (created_at DESC);
+  `);
+}
+
 function animalForTotalScore(total) {
   for (const t of ANIMAL_TIERS) {
     if (total >= t.min) {
@@ -84,8 +116,7 @@ function clampScore(n) {
   return Math.min(SCORE_MAX, Math.max(SCORE_MIN, x));
 }
 
-function buildLeaderboard() {
-  const { records } = readStore();
+function buildLeaderboardFromRecords(records) {
   const bySchool = new Map();
 
   for (const r of records) {
@@ -112,6 +143,66 @@ function buildLeaderboard() {
   return rows;
 }
 
+async function buildLeaderboard() {
+  if (pool) {
+    const { rows } = await pool.query(`
+      SELECT school AS university,
+             SUM(score)::bigint AS total_score,
+             COUNT(*)::int AS play_count
+      FROM score_records
+      GROUP BY school
+      ORDER BY SUM(score) DESC
+    `);
+    return rows.map((r) => {
+      const score = Number(r.total_score);
+      const animal = animalForTotalScore(score);
+      return {
+        university: r.university,
+        score,
+        playCount: r.play_count,
+        animal: animal.emoji,
+        animalName: animal.name
+      };
+    });
+  }
+  return buildLeaderboardFromRecords(readStore().records);
+}
+
+async function insertRecord(record) {
+  if (pool) {
+    await pool.query(
+      `INSERT INTO score_records (id, school, game, score, created_at)
+       VALUES ($1, $2, $3, $4, $5::timestamptz)`,
+      [record.id, record.school, record.game, record.score, record.createdAt]
+    );
+    return;
+  }
+  const store = readStore();
+  store.records.push(record);
+  writeStore(store);
+}
+
+async function fetchRecentRecords(n) {
+  if (pool) {
+    const { rows } = await pool.query(
+      `SELECT id, school, game, score, created_at
+       FROM score_records
+       ORDER BY created_at DESC
+       LIMIT $1`,
+      [n]
+    );
+    return rows.map((r) => ({
+      id: r.id,
+      school: r.school,
+      game: r.game,
+      score: r.score,
+      createdAt: r.created_at.toISOString()
+    }));
+  }
+  const { records } = readStore();
+  return records.slice(-n).reverse();
+}
+
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "32kb" }));
@@ -122,7 +213,11 @@ app.get("/health", (req, res) => {
 });
 
 app.get("/api/health", (req, res) => {
-  res.json({ ok: true, service: "animal-league-api" });
+  res.json({
+    ok: true,
+    service: "animal-league-api",
+    storage: pool ? "postgresql" : "json-file"
+  });
 });
 
 /**
@@ -130,7 +225,7 @@ app.get("/api/health", (req, res) => {
  * body: { school: string, game: string, score: number }
  *      (또는 university / schoolName — 동일하게 학교명으로 저장)
  */
-app.post("/api/scores", (req, res) => {
+app.post("/api/scores", async (req, res) => {
   const school = schoolFromBody(req.body);
   const game = typeof req.body.game === "string" ? req.body.game.trim().slice(0, 40) : "";
   const score = Number(req.body.score);
@@ -146,8 +241,6 @@ app.post("/api/scores", (req, res) => {
   }
 
   const finalScore = clampScore(score);
-
-  const store = readStore();
   const record = {
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
     school,
@@ -155,59 +248,94 @@ app.post("/api/scores", (req, res) => {
     score: finalScore,
     createdAt: new Date().toISOString()
   };
-  store.records.push(record);
-  writeStore(store);
 
-  const board = buildLeaderboard();
-  const mine = board.find((r) => r.university === school);
+  try {
+    await insertRecord(record);
+    const board = await buildLeaderboard();
+    const mine = board.find((r) => r.university === school);
 
-  res.status(201).json({
-    saved: record,
-    mySchool: mine || { university: school, score: 0, playCount: 0, animal: "🦝", animalName: "너구리" }
-  });
+    res.status(201).json({
+      saved: record,
+      mySchool:
+        mine || {
+          university: school,
+          score: 0,
+          playCount: 0,
+          animal: "🦝",
+          animalName: "너구리"
+        }
+    });
+  } catch (err) {
+    console.error("POST /api/scores", err);
+    res.status(500).json({ error: "failed to save score" });
+  }
 });
 
 /**
  * 학교별 누적 점수 랭킹
  * query: limit (기본 30)
  */
-app.get("/api/rankings", (req, res) => {
-  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 30));
-  const board = buildLeaderboard();
-  const slice = board.slice(0, limit).map((row, index) => ({
-    rank: index + 1,
-    ...row
-  }));
+app.get("/api/rankings", async (req, res) => {
+  try {
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 30));
+    const board = await buildLeaderboard();
+    const slice = board.slice(0, limit).map((row, index) => ({
+      rank: index + 1,
+      ...row
+    }));
 
-  const schoolQ = normalizeSchool(
-    req.query.school || req.query.university || req.query.schoolName || ""
-  );
-  let myRank = null;
-  if (schoolQ) {
-    const idx = board.findIndex((r) => r.university === schoolQ);
-    if (idx >= 0) {
-      myRank = { rank: idx + 1, ...board[idx] };
+    const schoolQ = normalizeSchool(
+      req.query.school || req.query.university || req.query.schoolName || ""
+    );
+    let myRank = null;
+    if (schoolQ) {
+      const idx = board.findIndex((r) => r.university === schoolQ);
+      if (idx >= 0) {
+        myRank = { rank: idx + 1, ...board[idx] };
+      }
     }
-  }
 
-  res.json({ rankings: slice, mySchool: myRank });
+    res.json({ rankings: slice, mySchool: myRank });
+  } catch (err) {
+    console.error("GET /api/rankings", err);
+    res.status(500).json({ error: "failed to load rankings" });
+  }
 });
 
 /**
  * 원시 기록 조회 (디버그·관리용, 최근 N건)
  */
-app.get("/api/scores/recent", (req, res) => {
-  const n = Math.min(200, Math.max(1, parseInt(req.query.n, 10) || 50));
-  const { records } = readStore();
-  const recent = records.slice(-n).reverse();
-  res.json({ records: recent });
+app.get("/api/scores/recent", async (req, res) => {
+  try {
+    const n = Math.min(200, Math.max(1, parseInt(req.query.n, 10) || 50));
+    const records = await fetchRecentRecords(n);
+    res.json({ records });
+  } catch (err) {
+    console.error("GET /api/scores/recent", err);
+    res.status(500).json({ error: "failed to load records" });
+  }
 });
 
-ensureDataFile();
+async function start() {
+  if (pool) {
+    try {
+      await initDb();
+      console.log("PostgreSQL connected (DATABASE_URL)");
+    } catch (err) {
+      console.error("PostgreSQL init failed:", err.message);
+      process.exit(1);
+    }
+  } else {
+    ensureDataFile();
+    console.log("Using local JSON file:", DATA_FILE);
+  }
 
-app.listen(PORT, () => {
-  console.log(`Animal League API http://localhost:${PORT}`);
-  console.log(`  GET  /health         (크론 keep-alive)`);
-  console.log(`  POST /api/scores   { school, game, score }`);
-  console.log(`  GET  /api/rankings?limit=30&school=학교명`);
-});
+  app.listen(PORT, () => {
+    console.log(`Animal League API http://localhost:${PORT}`);
+    console.log(`  GET  /health         (크론 keep-alive)`);
+    console.log(`  POST /api/scores   { school, game, score }`);
+    console.log(`  GET  /api/rankings?limit=30&school=학교명`);
+  });
+}
+
+start();
