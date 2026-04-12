@@ -67,6 +67,13 @@ function normalizeSchool(s) {
   return s.trim().slice(0, 60);
 }
 
+/** 프론트에서 school / university 등 다른 키로 보내는 경우 모두 허용 */
+function schoolFromBody(body) {
+  if (!body || typeof body !== "object") return "";
+  const raw = body.school ?? body.university ?? body.schoolName;
+  return normalizeSchool(typeof raw === "string" ? raw : "");
+}
+
 /** 한 판 점수 상한·하한 (악의적 값 방지, 음수는 학점 사냥 등에서 허용) */
 const SCORE_MIN = -100000;
 const SCORE_MAX = 1000000;
@@ -109,6 +116,11 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "32kb" }));
 
+/** Render 등 크론 keep-alive용 — 파일/DB 없이 즉시 응답 */
+app.get("/health", (req, res) => {
+  res.status(200).json({ ok: true });
+});
+
 app.get("/api/health", (req, res) => {
   res.json({ ok: true, service: "animal-league-api" });
 });
@@ -116,9 +128,10 @@ app.get("/api/health", (req, res) => {
 /**
  * 점수 기록 (게임 종료 시 프론트에서 호출)
  * body: { school: string, game: string, score: number }
+ *      (또는 university / schoolName — 동일하게 학교명으로 저장)
  */
 app.post("/api/scores", (req, res) => {
-  const school = normalizeSchool(req.body.school);
+  const school = schoolFromBody(req.body);
   const game = typeof req.body.game === "string" ? req.body.game.trim().slice(0, 40) : "";
   const score = Number(req.body.score);
 
@@ -166,7 +179,9 @@ app.get("/api/rankings", (req, res) => {
     ...row
   }));
 
-  const schoolQ = normalizeSchool(req.query.school || "");
+  const schoolQ = normalizeSchool(
+    req.query.school || req.query.university || req.query.schoolName || ""
+  );
   let myRank = null;
   if (schoolQ) {
     const idx = board.findIndex((r) => r.university === schoolQ);
@@ -192,6 +207,7 @@ ensureDataFile();
 
 app.listen(PORT, () => {
   console.log(`Animal League API http://localhost:${PORT}`);
+  console.log(`  GET  /health         (크론 keep-alive)`);
   console.log(`  POST /api/scores   { school, game, score }`);
   console.log(`  GET  /api/rankings?limit=30&school=학교명`);
 });
