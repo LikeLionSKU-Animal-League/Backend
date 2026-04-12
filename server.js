@@ -143,19 +143,33 @@ function buildLeaderboardFromRecords(records) {
   return rows;
 }
 
-async function buildLeaderboard() {
+// ⭐ 캐싱 변수 추가
+let cachedBoard = null;
+let lastFetch = 0;
+const CACHE_TTL = 3000; // 3초
+
+async function buildLeaderboard(limit = 30) {
   if (pool) {
+
+    // ⭐ 캐싱 적용
+    if (cachedBoard && Date.now() - lastFetch < CACHE_TTL) {
+      return cachedBoard.slice(0, limit);
+    }
+
     const { rows } = await pool.query(`
       SELECT school AS university,
              SUM(score)::bigint AS total_score,
              COUNT(*)::int AS play_count
       FROM score_records
       GROUP BY school
-      ORDER BY SUM(score) DESC
-    `);
-    return rows.map((r) => {
+      ORDER BY total_score DESC
+      LIMIT $1
+    `, [limit]);
+
+    const result = rows.map((r) => {
       const score = Number(r.total_score);
-      const animal = animalForTotalScore(score);
+      const animal = animalForTotalScore(score); // 기존 기능 유지
+
       return {
         university: r.university,
         score,
@@ -164,10 +178,18 @@ async function buildLeaderboard() {
         animalName: animal.name
       };
     });
+
+    // ⭐ 캐시 저장
+    cachedBoard = result;
+    lastFetch = Date.now();
+
+    return result;
   }
+
   return buildLeaderboardFromRecords(readStore().records);
 }
 
+// ⭐ insertRecord 수정 (캐시 초기화 추가)
 async function insertRecord(record) {
   if (pool) {
     await pool.query(
@@ -175,8 +197,13 @@ async function insertRecord(record) {
        VALUES ($1, $2, $3, $4, $5::timestamptz)`,
       [record.id, record.school, record.game, record.score, record.createdAt]
     );
+
+    // ⭐ 데이터 변경 → 캐시 초기화
+    cachedBoard = null;
+
     return;
   }
+
   const store = readStore();
   store.records.push(record);
   writeStore(store);
@@ -275,11 +302,15 @@ app.post("/api/scores", async (req, res) => {
  * 학교별 누적 점수 랭킹
  * query: limit (기본 30)
  */
+// ⭐ rankings API 수정 (핵심)
 app.get("/api/rankings", async (req, res) => {
   try {
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 30));
-    const board = await buildLeaderboard();
-    const slice = board.slice(0, limit).map((row, index) => ({
+
+    // ⭐ limit 전달
+    const board = await buildLeaderboard(limit);
+
+    const slice = board.map((row, index) => ({
       rank: index + 1,
       ...row
     }));
@@ -287,6 +318,7 @@ app.get("/api/rankings", async (req, res) => {
     const schoolQ = normalizeSchool(
       req.query.school || req.query.university || req.query.schoolName || ""
     );
+
     let myRank = null;
     if (schoolQ) {
       const idx = board.findIndex((r) => r.university === schoolQ);
