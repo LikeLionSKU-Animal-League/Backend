@@ -1,0 +1,18 @@
+{
+  "name": "animal-league-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "학교별 점수 저장·랭킹 API (프론트와 별도 실행)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.0"
+  }
+}
