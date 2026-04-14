@@ -146,13 +146,14 @@ function buildLeaderboardFromRecords(records) {
 // ⭐ 캐싱 변수 추가
 let cachedBoard = null;
 let lastFetch = 0;
+let cachedLimit = 0;
 const CACHE_TTL = 3000; // 3초
 
 async function buildLeaderboard(limit = 30) {
   if (pool) {
 
     // ⭐ 캐싱 적용
-    if (cachedBoard && Date.now() - lastFetch < CACHE_TTL) {
+    if (cachedBoard && limit <= cachedLimit && Date.now() - lastFetch < CACHE_TTL) {
       return cachedBoard.slice(0, limit);
     }
 
@@ -181,6 +182,7 @@ async function buildLeaderboard(limit = 30) {
 
     // ⭐ 캐시 저장
     cachedBoard = result;
+    cachedLimit = limit;
     lastFetch = Date.now();
 
     return result;
@@ -200,6 +202,7 @@ async function insertRecord(record) {
 
     // ⭐ 데이터 변경 → 캐시 초기화
     cachedBoard = null;
+    cachedLimit = 0;
 
     return;
   }
@@ -207,6 +210,54 @@ async function insertRecord(record) {
   const store = readStore();
   store.records.push(record);
   writeStore(store);
+}
+
+async function fetchSchoolSummary(school) {
+  if (!school) return null;
+
+  if (pool) {
+    const { rows } = await pool.query(
+      `WITH school_totals AS (
+         SELECT school,
+                SUM(score)::bigint AS total_score,
+                COUNT(*)::int AS play_count
+         FROM score_records
+         GROUP BY school
+       )
+       SELECT t.school AS university,
+              t.total_score,
+              t.play_count,
+              (
+                SELECT COUNT(*)::int + 1
+                FROM school_totals t2
+                WHERE t2.total_score > t.total_score
+              ) AS rank
+       FROM school_totals t
+       WHERE t.school = $1`,
+      [school]
+    );
+
+    if (!rows.length) return null;
+
+    const score = Number(rows[0].total_score);
+    const animal = animalForTotalScore(score);
+    return {
+      rank: Number(rows[0].rank),
+      university: rows[0].university,
+      score,
+      playCount: Number(rows[0].play_count),
+      animal: animal.emoji,
+      animalName: animal.name
+    };
+  }
+
+  const board = buildLeaderboardFromRecords(readStore().records);
+  const idx = board.findIndex((r) => r.university === school);
+  if (idx < 0) return null;
+  return {
+    rank: idx + 1,
+    ...board[idx]
+  };
 }
 
 async function fetchRecentRecords(n) {
@@ -278,8 +329,7 @@ app.post("/api/scores", async (req, res) => {
 
   try {
     await insertRecord(record);
-    const board = await buildLeaderboard();
-    const mine = board.find((r) => r.university === school);
+    const mine = await fetchSchoolSummary(school);
 
     res.status(201).json({
       saved: record,
@@ -321,10 +371,7 @@ app.get("/api/rankings", async (req, res) => {
 
     let myRank = null;
     if (schoolQ) {
-      const idx = board.findIndex((r) => r.university === schoolQ);
-      if (idx >= 0) {
-        myRank = { rank: idx + 1, ...board[idx] };
-      }
+      myRank = await fetchSchoolSummary(schoolQ);
     }
 
     res.json({ rankings: slice, mySchool: myRank });
