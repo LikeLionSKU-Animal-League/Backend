@@ -214,8 +214,43 @@ let lastFetch = 0;
 let cachedLimit = 0;
 const CACHE_TTL = 3000; // 3초
 
+// school_scores가 비어있을 수 있는 배포/마이그레이션 상황 대비
+// (score_records에는 데이터가 있는데 school_scores는 누락된 경우) 백필한다.
+let schoolScoresEnsured = false;
+async function ensureSchoolScoresSeeded() {
+  if (!pool) return;
+  if (schoolScoresEnsured) return;
+
+  const { rows } = await pool.query(
+    `SELECT 1
+     FROM school_scores
+     LIMIT 1`
+  );
+
+  if (rows.length > 0) {
+    schoolScoresEnsured = true;
+    return;
+  }
+
+  await pool.query(
+    `
+    INSERT INTO school_scores (school, total_score, play_count, updated_at)
+    SELECT
+      school,
+      COALESCE(SUM(score), 0)::int AS total_score,
+      COUNT(*)::int AS play_count,
+      NOW() AS updated_at
+    FROM score_records
+    GROUP BY school
+    `
+  );
+
+  schoolScoresEnsured = true;
+}
+
 async function buildLeaderboard(limit = 30) {
   if (pool) {
+    await ensureSchoolScoresSeeded();
 
     // ⭐ 캐싱 적용
     if (cachedBoard && limit <= cachedLimit && Date.now() - lastFetch < CACHE_TTL) {
@@ -289,6 +324,7 @@ async function fetchSchoolSummary(school) {
   if (!school) return null;
 
   if (pool) {
+    await ensureSchoolScoresSeeded();
     const { rows } = await pool.query(
       `WITH school_totals AS (
          SELECT
@@ -335,6 +371,7 @@ async function fetchSchoolSummary(school) {
 
 async function fetchRecentRecords(n) {
   if (pool) {
+    await ensureSchoolScoresSeeded();
     const { rows } = await pool.query(
       `SELECT school, total_score, play_count, updated_at
        FROM school_scores
