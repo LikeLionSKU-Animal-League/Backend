@@ -71,6 +71,7 @@ function writeStore(data) {
 }
 
 async function initDb() {
+  // 신규 배포용 기본 스키마
   await pool.query(`
     CREATE TABLE IF NOT EXISTS score_records (
       id VARCHAR(64) PRIMARY KEY,
@@ -82,6 +83,74 @@ async function initDb() {
     );
     CREATE INDEX IF NOT EXISTS idx_score_records_school ON score_records (school);
     CREATE INDEX IF NOT EXISTS idx_score_records_created_at ON score_records (created_at DESC);
+
+    /* 학교별 1행 요약 테이블 (누적 점수/플레이 횟수) */
+    CREATE TABLE IF NOT EXISTS school_scores (
+      school VARCHAR(60) PRIMARY KEY,
+      total_score INTEGER NOT NULL DEFAULT 0,
+      play_count INTEGER NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  // 기존 score_records 데이터가 있다면(구버전) school_scores가 비어있을 때 1회 시드
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM school_scores) THEN
+        INSERT INTO school_scores (school, total_score, play_count, updated_at)
+        SELECT
+          school,
+          COALESCE(SUM(score), 0)::int AS total_score,
+          COUNT(*)::int AS play_count,
+          NOW() AS updated_at
+        FROM score_records
+        GROUP BY school;
+      END IF;
+    END $$;
+  `);
+
+  // 구버전 테이블(컬럼 누락/타입 불일치)을 실행 시점에 자동 보정
+  await pool.query(`
+    ALTER TABLE score_records ADD COLUMN IF NOT EXISTS id VARCHAR(64);
+    ALTER TABLE score_records ADD COLUMN IF NOT EXISTS school VARCHAR(60);
+    ALTER TABLE score_records ADD COLUMN IF NOT EXISTS game VARCHAR(40);
+    ALTER TABLE score_records ADD COLUMN IF NOT EXISTS score INTEGER;
+    ALTER TABLE score_records ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;
+  `);
+
+  // id가 숫자형 등으로 만들어졌던 구버전 대비: 문자열 id로 통일
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'score_records'
+          AND column_name = 'id'
+          AND data_type <> 'character varying'
+      ) THEN
+        ALTER TABLE score_records
+          ALTER COLUMN id TYPE VARCHAR(64)
+          USING id::text;
+      END IF;
+    END $$;
+  `);
+
+  // 누락값 보정 (기존 데이터 유지)
+  await pool.query(`
+    UPDATE score_records
+       SET game = 'legacy'
+     WHERE game IS NULL OR btrim(game) = '';
+
+    UPDATE score_records
+       SET created_at = NOW()
+     WHERE created_at IS NULL;
+
+    UPDATE score_records
+       SET id = 'legacy-' || substr(md5(random()::text || clock_timestamp()::text), 1, 24)
+     WHERE id IS NULL OR btrim(id) = '';
   `);
 }
 
@@ -159,11 +228,11 @@ async function buildLeaderboard(limit = 30) {
 
     const { rows } = await pool.query(`
       SELECT school AS university,
-             SUM(score)::bigint AS total_score,
-             COUNT(*)::int AS play_count
-      FROM score_records
-      GROUP BY school
-      ORDER BY total_score DESC
+             total_score::bigint AS total_score,
+             play_count::int AS play_count,
+             updated_at
+      FROM school_scores
+      ORDER BY total_score DESC, updated_at DESC
       LIMIT $1
     `, [limit]);
 
@@ -194,10 +263,18 @@ async function buildLeaderboard(limit = 30) {
 // ⭐ insertRecord 수정 (캐시 초기화 추가)
 async function insertRecord(record) {
   if (pool) {
+    /* 학교별 1행만 유지: 누적/횟수만 업데이트 */
     await pool.query(
-      `INSERT INTO score_records (id, school, game, score, created_at)
-       VALUES ($1, $2, $3, $4, $5::timestamptz)`,
-      [record.id, record.school, record.game, record.score, record.createdAt]
+      `
+      INSERT INTO school_scores (school, total_score, play_count, updated_at)
+      VALUES ($1, $2, 1, NOW())
+      ON CONFLICT (school) DO UPDATE
+      SET
+        total_score = school_scores.total_score + EXCLUDED.total_score,
+        play_count = school_scores.play_count + 1,
+        updated_at = NOW()
+      `,
+      [record.school, record.score]
     );
 
     // ⭐ 데이터 변경 → 캐시 초기화
@@ -218,11 +295,11 @@ async function fetchSchoolSummary(school) {
   if (pool) {
     const { rows } = await pool.query(
       `WITH school_totals AS (
-         SELECT school,
-                SUM(score)::bigint AS total_score,
-                COUNT(*)::int AS play_count
-         FROM score_records
-         GROUP BY school
+         SELECT
+           school,
+           total_score::bigint AS total_score,
+           play_count::int AS play_count
+         FROM school_scores
        )
        SELECT t.school AS university,
               t.total_score,
@@ -263,18 +340,19 @@ async function fetchSchoolSummary(school) {
 async function fetchRecentRecords(n) {
   if (pool) {
     const { rows } = await pool.query(
-      `SELECT id, school, game, score, created_at
-       FROM score_records
-       ORDER BY created_at DESC
+      `SELECT school, total_score, play_count, updated_at
+       FROM school_scores
+       ORDER BY updated_at DESC
        LIMIT $1`,
       [n]
     );
+
     return rows.map((r) => ({
-      id: r.id,
+      id: null,
       school: r.school,
-      game: r.game,
-      score: r.score,
-      createdAt: r.created_at.toISOString()
+      game: "summary",
+      score: r.total_score,
+      createdAt: r.updated_at.toISOString()
     }));
   }
   const { records } = readStore();
