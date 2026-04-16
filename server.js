@@ -13,6 +13,7 @@ const path = require("path");
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
+const rateLimit = require("express-rate-limit");
 
 const PORT = Number(process.env.PORT) || 3000;
 const DATABASE_URL = process.env.DATABASE_URL || "";
@@ -24,9 +25,10 @@ function createPool() {
   if (!DATABASE_URL) return null;
   const useSsl =
     DATABASE_URL.includes("sslmode=require") || /\.render\.com\//.test(DATABASE_URL);
+  const rejectUnauthorized = process.env.DB_SSL_REJECT_UNAUTHORIZED !== "false";
   return new Pool({
     connectionString: DATABASE_URL,
-    ...(useSsl ? { ssl: { rejectUnauthorized: false } } : {})
+    ...(useSsl ? { ssl: { rejectUnauthorized } } : {})
   });
 }
 
@@ -260,7 +262,7 @@ async function buildLeaderboard(limit = 30) {
   return buildLeaderboardFromRecords(readStore().records);
 }
 
-// ⭐ insertRecord 수정 (캐시 초기화 추가)
+// ⭐ insertRecord 수정 (캐시 초기화 + 중복 방지 추가)
 async function insertRecord(record) {
   if (pool) {
     /* 학교별 1행만 유지: 누적/횟수만 업데이트 */
@@ -359,8 +361,47 @@ async function fetchRecentRecords(n) {
   return records.slice(-n).reverse();
 }
 
+/** 허용 게임 목록 (환경변수 미설정 시 검증 생략) */
+const VALID_GAMES = process.env.VALID_GAMES
+  ? process.env.VALID_GAMES.split(",").map((g) => g.trim()).filter(Boolean)
+  : null;
+
+/** Rate limiters */
+const scoreLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests. Please try again later." }
+});
+
+const readLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests. Please try again later." }
+});
+
+/** 허용 출처 화이트리스트 (환경변수 미설정 시 전체 허용) */
+const allowedOrigins = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(",").map((o) => o.trim()).filter(Boolean)
+  : null;
+
+const corsOptions = allowedOrigins
+  ? {
+      origin: (origin, callback) => {
+        if (!origin || allowedOrigins.includes(origin)) {
+          callback(null, true);
+        } else {
+          callback(new Error("Not allowed by CORS"));
+        }
+      }
+    }
+  : {};
+
 const app = express();
-app.use(cors());
+app.use(cors(corsOptions));
 app.use(express.json({ limit: "32kb" }));
 
 /** Render 등 크론 keep-alive용 — 파일/DB 없이 즉시 응답 */
@@ -381,7 +422,7 @@ app.get("/api/health", (req, res) => {
  * body: { school: string, game: string, score: number }
  *      (또는 university / schoolName — 동일하게 학교명으로 저장)
  */
-app.post("/api/scores", async (req, res) => {
+app.post("/api/scores", scoreLimiter, async (req, res) => {
   const school = schoolFromBody(req.body);
   const game = typeof req.body.game === "string" ? req.body.game.trim().slice(0, 40) : "";
   const score = Number(req.body.score);
@@ -391,6 +432,9 @@ app.post("/api/scores", async (req, res) => {
   }
   if (!game) {
     return res.status(400).json({ error: "game is required" });
+  }
+  if (VALID_GAMES && !VALID_GAMES.includes(game)) {
+    return res.status(400).json({ error: `game must be one of: ${VALID_GAMES.join(", ")}` });
   }
   if (!Number.isFinite(score)) {
     return res.status(400).json({ error: "score must be a number" });
@@ -421,6 +465,9 @@ app.post("/api/scores", async (req, res) => {
         }
     });
   } catch (err) {
+    if (err.code === "DUPLICATE") {
+      return res.status(409).json({ error: "duplicate submission" });
+    }
     console.error("POST /api/scores", err);
     res.status(500).json({ error: "failed to save score" });
   }
@@ -431,7 +478,7 @@ app.post("/api/scores", async (req, res) => {
  * query: limit (기본 30)
  */
 // ⭐ rankings API 수정 (핵심)
-app.get("/api/rankings", async (req, res) => {
+app.get("/api/rankings", readLimiter, async (req, res) => {
   try {
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 30));
 
@@ -462,7 +509,7 @@ app.get("/api/rankings", async (req, res) => {
 /**
  * 원시 기록 조회 (디버그·관리용, 최근 N건)
  */
-app.get("/api/scores/recent", async (req, res) => {
+app.get("/api/scores/recent", readLimiter, async (req, res) => {
   try {
     const n = Math.min(200, Math.max(1, parseInt(req.query.n, 10) || 50));
     const records = await fetchRecentRecords(n);
