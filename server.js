@@ -161,7 +161,13 @@ function animalForTotalScore(total) {
 
 function normalizeSchool(s) {
   if (typeof s !== "string") return "";
-  return s.trim().slice(0, 60);
+  // 학교명 비교 시 흔히 섞이는 숨은문자/중복 공백/유니코드 차이를 제거한다.
+  return s
+    .normalize("NFKC")
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 60);
 }
 
 /** 프론트에서 school / university 등 다른 키로 보내는 경우 모두 허용 */
@@ -185,7 +191,7 @@ function buildLeaderboardFromRecords(records) {
   const bySchool = new Map();
 
   for (const r of records) {
-    const key = r.school;
+    const key = normalizeSchool(r.school);
     if (!key) continue;
     const prev = bySchool.get(key) || { totalScore: 0, playCount: 0 };
     prev.totalScore += Number(r.score) || 0;
@@ -214,12 +220,76 @@ let lastFetch = 0;
 let cachedLimit = 0;
 const CACHE_TTL = 3000; // 3초
 
+async function normalizeLegacySchoolNamesInScoreRecords() {
+  if (!pool) return;
+
+  const { rows } = await pool.query(`SELECT DISTINCT school FROM score_records`);
+  for (const row of rows) {
+    const raw = row.school || "";
+    const normalized = normalizeSchool(raw);
+    if (!normalized || normalized === raw) continue;
+    await pool.query(
+      `UPDATE score_records
+       SET school = $1
+       WHERE school = $2`,
+      [normalized, raw]
+    );
+  }
+}
+
+async function mergeSchoolScoresByCanonicalName() {
+  if (!pool) return;
+
+  const { rows } = await pool.query(
+    `SELECT school, total_score, play_count, updated_at
+     FROM school_scores`
+  );
+  if (!rows.length) return;
+
+  const merged = new Map();
+  for (const row of rows) {
+    const key = normalizeSchool(row.school);
+    if (!key) continue;
+    const prev = merged.get(key) || {
+      school: key,
+      totalScore: 0,
+      playCount: 0,
+      updatedAt: row.updated_at
+    };
+    prev.totalScore += Number(row.total_score) || 0;
+    prev.playCount += Number(row.play_count) || 0;
+    if (new Date(row.updated_at).getTime() > new Date(prev.updatedAt).getTime()) {
+      prev.updatedAt = row.updated_at;
+    }
+    merged.set(key, prev);
+  }
+
+  await pool.query("BEGIN");
+  try {
+    await pool.query("DELETE FROM school_scores");
+    for (const item of merged.values()) {
+      await pool.query(
+        `INSERT INTO school_scores (school, total_score, play_count, updated_at)
+         VALUES ($1, $2, $3, $4::timestamptz)`,
+        [item.school, item.totalScore, item.playCount, item.updatedAt]
+      );
+    }
+    await pool.query("COMMIT");
+  } catch (e) {
+    await pool.query("ROLLBACK");
+    throw e;
+  }
+}
+
 // school_scores가 비어있을 수 있는 배포/마이그레이션 상황 대비
 // (score_records에는 데이터가 있는데 school_scores는 누락된 경우) 백필한다.
 let schoolScoresEnsured = false;
 async function ensureSchoolScoresSeeded() {
   if (!pool) return;
   if (schoolScoresEnsured) return;
+
+  await normalizeLegacySchoolNamesInScoreRecords();
+  await mergeSchoolScoresByCanonicalName();
 
   const { rows } = await pool.query(
     `SELECT 1
