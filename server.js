@@ -78,7 +78,6 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS score_records (
       id VARCHAR(64) PRIMARY KEY,
       school VARCHAR(60) NOT NULL,
-      game VARCHAR(40) NOT NULL,
       score INTEGER NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       CONSTRAINT score_records_score_range CHECK (score >= -100000 AND score <= 1000000)
@@ -116,7 +115,6 @@ async function initDb() {
   await pool.query(`
     ALTER TABLE score_records ADD COLUMN IF NOT EXISTS id VARCHAR(64);
     ALTER TABLE score_records ADD COLUMN IF NOT EXISTS school VARCHAR(60);
-    ALTER TABLE score_records ADD COLUMN IF NOT EXISTS game VARCHAR(40);
     ALTER TABLE score_records ADD COLUMN IF NOT EXISTS score INTEGER;
     ALTER TABLE score_records ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;
   `);
@@ -142,10 +140,6 @@ async function initDb() {
 
   // 누락값 보정 (기존 데이터 유지)
   await pool.query(`
-    UPDATE score_records
-       SET game = 'legacy'
-     WHERE game IS NULL OR btrim(game) = '';
-
     UPDATE score_records
        SET created_at = NOW()
      WHERE created_at IS NULL;
@@ -419,22 +413,22 @@ app.get("/api/health", (req, res) => {
 
 /**
  * 점수 기록 (게임 종료 시 프론트에서 호출)
- * body: { school: string, game: string, score: number }
+ * body: { school: string, game?: string, score: number }
  *      (또는 university / schoolName — 동일하게 학교명으로 저장)
  */
 app.post("/api/scores", scoreLimiter, async (req, res) => {
   const school = schoolFromBody(req.body);
-  const game = typeof req.body.game === "string" ? req.body.game.trim().slice(0, 40) : "";
+  const gameRaw = typeof req.body.game === "string" ? req.body.game.trim().slice(0, 40) : "";
   const score = Number(req.body.score);
 
   if (!school) {
     return res.status(400).json({ error: "school is required" });
   }
-  if (!game) {
-    return res.status(400).json({ error: "game is required" });
-  }
-  if (VALID_GAMES && !VALID_GAMES.includes(game)) {
-    return res.status(400).json({ error: `game must be one of: ${VALID_GAMES.join(", ")}` });
+  // school_scores 기반 집계에는 game이 필요하지 않으므로 game 검증은 “있을 때만” 수행합니다.
+  if (VALID_GAMES && gameRaw && !VALID_GAMES.includes(gameRaw)) {
+    return res
+      .status(400)
+      .json({ error: `game must be one of: ${VALID_GAMES.join(", ")}` });
   }
   if (!Number.isFinite(score)) {
     return res.status(400).json({ error: "score must be a number" });
@@ -444,7 +438,8 @@ app.post("/api/scores", scoreLimiter, async (req, res) => {
   const record = {
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
     school,
-    game,
+    // DB 집계에는 game이 쓰이지 않지만, 디버그/원시기록용으로는 유지합니다.
+    game: gameRaw || "unknown",
     score: finalScore,
     createdAt: new Date().toISOString()
   };
